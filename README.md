@@ -50,3 +50,7 @@ The `generate` method in both `BigramLanguageModel` and `GPTLanguageModel` can b
 ## Dataset
 
 The `input.txt` file contains a collection of Shakespeare's works. This is used as the training data for the language models.
+
+## Acknowledgements
+
+This repository is based on the [nanoGPT video lecture series by Andrej Karpathy](https://github.com/karpathy/ng-video-lecture/tree/master).
