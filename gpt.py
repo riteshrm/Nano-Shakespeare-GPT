@@ -5,7 +5,7 @@ import trackio
 from tqdm import tqdm
 # Hyperparameters
 batch_size = 8 # 
-block_size = 256 # Maximum context length for prediction
+block_size = 32 # Maximum context length for prediction
 train_steps = 100000
 eval_steps = 200
 learning_rate = 3e-4
@@ -262,7 +262,7 @@ for step in progress:
     if step%eval_steps==0:
         losses = evaluate(model)
         with torch.inference_mode():
-            generated_ids = model.generate(torch.tensor(encode("Hi there"), dtype=torch.long).unsqueeze(0).to(device), max_new_tokens=100)
+            generated_ids = model.generate(torch.tensor(encode("Hi there"), dtype=torch.long).unsqueeze(0).to(device), max_new_tokens=100, use_kv_cache=True)
         generated_text = decode(generated_ids[0].tolist())
 
         metrics.update({
