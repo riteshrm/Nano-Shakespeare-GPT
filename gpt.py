@@ -1,8 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-
+import trackio
+from tqdm import tqdm
 # Hyperparameters
 batch_size = 8 # 
 block_size = 256 # Maximum context length for prediction
@@ -15,8 +15,12 @@ num_layers = 6
 device = "cuda" if torch.cuda.is_available() else 'cpu'
 n_embd = 384
 
-
 torch.manual_seed(1337)
+
+trackio.init(
+        project="nanoGPT",
+        config={"steps": train_steps, "learning_rate":learning_rate, "batch_size": batch_size}
+    )
 
 with open('input.txt', 'r') as f:
     text = f.read()
@@ -78,18 +82,16 @@ for b in range(batch_size):
         target = y[b, i]
         print(f"When input is: {input.tolist()}, the target is: {target}")
 
-@torch.no_grad()
+@torch.inference_mode()
 def evaluate(model):
-    model.eval()
     out = {}
-    for split in ["train", "val"]:
+    for split in ["val"]:
         losses = []
-        for iters in range(eval_steps):
+        for _ in range(eval_steps):
             x, y = get_batch(batch_size, split)
-            logits, loss = model(x, y)
+            _, loss, _ = model(x, y)
             losses.append(loss.item())
         out[split]  = sum(losses)/len(losses)
-    model.train()
     return out
         
 class Head(nn.Module):
@@ -101,17 +103,26 @@ class Head(nn.Module):
         self.register_buffer("trill", torch.tril(torch.ones(block_size, block_size)))
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x):
+    def forward(self, x, use_kv_cache, past_kv=None):
         B, T, C = x.shape
         q = self.query(x)
         k = self.key(x)
-        wei = q @ k.transpose(-2, -1) * C**0.5
-        wei = wei.masked_fill(self.trill[:T, :T]==0, float('-inf'))
+        v = self.value(x)
+        if past_kv is not None:
+            cache_k, cache_v = past_kv
+            k = torch.cat([cache_k,k], dim=1)
+            v = torch.cat([cache_v,v], dim=1)
+        present_kv = None
+        if use_kv_cache:
+            present_kv = [k, v]
+        wei = q @ k.transpose(-2, -1) * q.size(-1)**-0.5
+        if past_kv is None:
+            wei = wei.masked_fill(self.trill[:T, :T]==0, float('-inf'))
         wei = F.softmax(wei, dim=-1)
         wei = self.dropout(wei)
-        v = self.value(x)
+        
         out = wei @ v
-        return out
+        return out, present_kv
     
 class MultiHeadAttention(nn.Module):
     def __init__(self, num_heads, head_size):
@@ -119,10 +130,17 @@ class MultiHeadAttention(nn.Module):
         self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
         self.proj_out = nn.Linear(n_embd, n_embd)
         self.dropout = nn.Dropout(dropout)
-    def forward(self, x):
-        out = torch.cat([h(x) for h in self.heads], dim=-1)
+    def forward(self, x, use_kv_cache, past_kv=None):
+        present_kv = []
+        final_out = []
+        for i, h in enumerate(self.heads):
+            out, kv_cache = h(x, use_kv_cache, None if past_kv is None else past_kv[i] )
+            final_out.append(out)
+            present_kv.append(kv_cache)
+
+        out = torch.cat(final_out, dim=-1)
         out = self.dropout(self.proj_out(out))
-        return out
+        return out, present_kv
     
 class FeedForward(nn.Module):
     def __init__(self, n_embd):
@@ -143,10 +161,11 @@ class Block(nn.Module):
         self.ln1 = nn.LayerNorm(n_embd)
         self.ln2 = nn.LayerNorm(n_embd)
 
-    def forward(self, x):
-        x = x + self.sa_head(self.ln1(x))
+    def forward(self, x, use_kv_cache, past_kv=None):
+        hidden_states, present_kv = self.sa_head(self.ln1(x), use_kv_cache, past_kv)
+        x = x + hidden_states
         x = x + self.ffwd(self.ln2(x))
-        return x
+        return x, present_kv
     
 class GPTLanguageModel(nn.Module):
     def __init__(self):
@@ -154,21 +173,33 @@ class GPTLanguageModel(nn.Module):
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
 
-        self.blocks = nn.Sequential(*[Block(num_heads, n_embd) for _ in range(num_layers)])
+        self.blocks = nn.ModuleList([Block(num_heads, n_embd) for _ in range(num_layers)])
         self.ln_f = nn.LayerNorm(n_embd)
         self.lm_head = nn.Linear(n_embd, vocab_size)
 
-    def forward(self, idx, target=None):
+    def forward(self, idx, target=None, use_kv_cache=False, past_key_values=None):
 
         # idx = [B , T]
         # target = [B, T]
         B, T = idx.shape
         
         tok_emb = self.token_embedding_table(idx) # [B, T, n_embd]
-        pos_emb = self.position_embedding_table(torch.arange(T, device = device)) # [T, n_embd]
+        if not use_kv_cache or past_key_values is None:
+            pos_emb = self.position_embedding_table(torch.arange(T, device = device)) # [T, n_embd]
+        else:
+            past_length = past_key_values[0][0][0].shape[1]
+            pos_emb = self.position_embedding_table(torch.tensor([past_length], device = device)) # [1, n_embd] Only for the token which we have predicted
         x = tok_emb + pos_emb
-        
-        x = self.blocks(x)
+
+        present_key_values = None
+        if use_kv_cache:
+            present_key_values = []
+        for i, block in enumerate(self.blocks):
+            past_kv = None if past_key_values is None else past_key_values[i]
+            x, present_kv = block(x, use_kv_cache, past_kv)
+
+            if use_kv_cache:
+                present_key_values.append(present_kv)
         x = self.ln_f(x)
             
         logits = self.lm_head(x) # [B, T, vocab_size]
@@ -181,16 +212,22 @@ class GPTLanguageModel(nn.Module):
             target = target.view(B*T)
             loss = F.cross_entropy(logits, target)
 
-        return logits, loss
+        return logits, loss, present_key_values
     
-    def generate(self, idx, max_new_tokens):
+    def generate(self, idx, max_new_tokens, use_kv_cache=False):
         # idx = [B, T]array of indices in the current context
-
-        for _ in range(max_new_tokens):
-            # crp the index till block_size
+        
+        past_key_values = None
+        for i in range(max_new_tokens):
+            # crop the index till block_size
             idx_cond = idx[:, -block_size:]
+            if past_key_values is not None and past_key_values[0][0][0].shape[1]>=block_size:
+                past_key_values = None
             # get the prediction
-            logits, _ = self(idx_cond) 
+            if use_kv_cache and past_key_values is not None:
+                logits, _, past_key_values = self(idx_next, target=None, use_kv_cache=use_kv_cache, past_key_values=past_key_values) 
+            else:
+                logits, _, past_key_values = self(idx_cond, target=None, use_kv_cache=use_kv_cache, past_key_values=past_key_values) 
             # Focus on last time step
             logits = logits[:,-1,:] # [B, C]
             # apply softmax to get the probabilty
@@ -199,29 +236,55 @@ class GPTLanguageModel(nn.Module):
             idx_next = torch.multinomial(probs, num_samples=1) # [B, 1]
             # append sampled index to the running sequnce
             idx = torch.cat((idx, idx_next), dim=1) # [B, T+1]
+        del past_key_values
         return idx
     
 model = GPTLanguageModel().to(device)
-logits, loss = model(x, y)
-print(logits.shape, loss)
+logits, loss, _ = model(x, y)
 
 decode(model.generate(torch.tensor(encode("Hi there"), dtype=torch.long).unsqueeze(0).to(device), max_new_tokens=100)[0].tolist())
 
 # Optimizer
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 
-
-for step in range(train_steps):
+progress = tqdm(range(train_steps))
+for step in progress:
     x, y = get_batch(batch_size, "train")
-    logits, loss = model(x, y)
+    logits, loss, _ = model(x, y)
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
     optimizer.step()
 
+    metrics = {
+            "train_loss": loss.item(),
+        }
+
     if step%eval_steps==0:
-        out = evaluate(model)
-        print(f"Step-{step}:- Train Loss is {out['train']} and Val Loss is {out['val']}")
-        generated_text = decode(model.generate(torch.tensor(encode("Hi there"), dtype=torch.long).unsqueeze(0).to(device), max_new_tokens=100)[0].tolist())
-        print()
-        print("generated_text:- ", generated_text)
-        print()
+        losses = evaluate(model)
+        with torch.inference_mode():
+            generated_ids = model.generate(torch.tensor(encode("Hi there"), dtype=torch.long).unsqueeze(0).to(device), max_new_tokens=100)
+        generated_text = decode(generated_ids[0].tolist())
+
+        metrics.update({
+                "val_loss": losses["val"],
+                "generated_samples": trackio.Table(
+                    columns=[
+                        "step",
+                        "prompt",
+                        "generated_text",
+                    ],
+                    data=[[
+                        step,
+                        "Hi there",
+                        generated_text,
+                    ]],
+                ),
+            })
+
+    trackio.log(metrics, step=step)
+
+    progress.set_postfix(
+            train_loss=f"{loss.item():.4f}"
+        )
+
+trackio.finish()
