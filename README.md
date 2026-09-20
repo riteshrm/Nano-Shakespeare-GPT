@@ -98,7 +98,7 @@ The generation length exceeds the 128-token context window. After the window fil
 
 ## Dataset
 
-The repository uses Andrej Karpathy's [Tiny Shakespeare dataset](https://github.com/karpathy/char-rnn/blob/master/data/tinyshakespeare/input.txt), containing 40,000 lines from a selection of Shakespeare's works. The local file's size and SHA-256 checksum match that source exactly.
+The repository uses Andrej Karpathy's [Tiny Shakespeare dataset](https://github.com/karpathy/char-rnn/blob/master/data/tinyshakespeare/input.txt), containing 40,000 lines from a selection of Shakespeare's works.
 
 ## Acknowledgements
 
