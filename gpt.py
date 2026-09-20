@@ -5,7 +5,7 @@ import trackio
 from tqdm import tqdm
 # Hyperparameters
 batch_size = 8 # 
-block_size = 32 # Maximum context length for prediction
+block_size = 256 # Maximum context length for prediction
 train_steps = 100000
 eval_steps = 200
 learning_rate = 3e-4
@@ -17,47 +17,25 @@ n_embd = 384
 
 torch.manual_seed(1337)
 
-trackio.init(
-        project="nanoGPT",
-        config={"steps": train_steps, "learning_rate":learning_rate, "batch_size": batch_size}
-    )
-
 with open('input.txt', 'r') as f:
     text = f.read()
 
-print("length of dataset in characters: ", len(text))
 
 chars = sorted(list(set(text)))
 vocab_size = len(chars)
 
-print("vocab_size: ",vocab_size)
-print("vocab: ",''.join(chars))
 
 stoi = {ch : i for i, ch in enumerate(chars)}
 itos = {i : ch for i, ch in enumerate(chars)}
 encode = lambda s: [stoi[c] for c in s]
 decode = lambda l: ''.join([itos[i] for i in l])
 
-print(encode("Hi there!"))
-print(decode(encode("Hi there!")))
-
 data = torch.tensor(encode(text), dtype=torch.long)
-
-print(data.shape, data.dtype)
-print(data[:10])
-
 n = int(0.9*len(data))
 
 train_data = data[:n]
 val_data = data[n:]
 
-x = train_data[:block_size]
-y = train_data[1:block_size+1]
-
-for t in range(block_size):
-    input = x[:t+1]
-    target = y[t]
-    print(f"When input is: {input}, the target is: {target}")
 
 def get_batch(batch_size, split):
     data = train_data if split == "train" else val_data
@@ -66,21 +44,6 @@ def get_batch(batch_size, split):
     target = torch.stack([data[i+1:i+block_size + 1] for i in idx])
 
     return input.to(device), target.to(device)
-
-x, y = get_batch(batch_size, "train")
-print('inputs:')
-print("shape", x.shape)
-print(x)
-
-print('outputs:')
-print("shape", y.shape)
-print(y)
-
-for b in range(batch_size):
-    for i in range(block_size):
-        input = x[b, :i+1]
-        target = y[b, i]
-        print(f"When input is: {input.tolist()}, the target is: {target}")
 
 @torch.inference_mode()
 def evaluate(model):
@@ -214,6 +177,7 @@ class GPTLanguageModel(nn.Module):
 
         return logits, loss, present_key_values
     
+    @torch.inference_mode()
     def generate(self, idx, max_new_tokens, use_kv_cache=False):
         # idx = [B, T]array of indices in the current context
         
@@ -239,52 +203,60 @@ class GPTLanguageModel(nn.Module):
         del past_key_values
         return idx
     
-model = GPTLanguageModel().to(device)
-logits, loss, _ = model(x, y)
 
-decode(model.generate(torch.tensor(encode("Hi there"), dtype=torch.long).unsqueeze(0).to(device), max_new_tokens=100)[0].tolist())
 
-# Optimizer
-optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+def main():
+    trackio.init(
+        project="nanoGPT",
+        config={"steps": train_steps, "learning_rate":learning_rate, "batch_size": batch_size}
+    )
+    model = GPTLanguageModel().to(device)
+    # Optimizer
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 
-progress = tqdm(range(train_steps))
-for step in progress:
-    x, y = get_batch(batch_size, "train")
-    logits, loss, _ = model(x, y)
-    optimizer.zero_grad(set_to_none=True)
-    loss.backward()
-    optimizer.step()
+    progress = tqdm(range(train_steps))
+    for step in progress:
+        x, y = get_batch(batch_size, "train")
+        logits, loss, _ = model(x, y)
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
 
-    metrics = {
-            "train_loss": loss.item(),
-        }
+        metrics = {
+                "train_loss": loss.item(),
+            }
 
-    if step%eval_steps==0:
-        losses = evaluate(model)
-        with torch.inference_mode():
-            generated_ids = model.generate(torch.tensor(encode("Hi there"), dtype=torch.long).unsqueeze(0).to(device), max_new_tokens=100, use_kv_cache=True)
-        generated_text = decode(generated_ids[0].tolist())
+        if step%eval_steps==0:
+            model.eval()
+            losses = evaluate(model)
+            with torch.inference_mode():
+                generated_ids = model.generate(torch.tensor(encode("Hi there"), dtype=torch.long).unsqueeze(0).to(device), max_new_tokens=100, use_kv_cache=True)
+            generated_text = decode(generated_ids[0].tolist())
+            model.train()
 
-        metrics.update({
-                "val_loss": losses["val"],
-                "generated_samples": trackio.Table(
-                    columns=[
-                        "step",
-                        "prompt",
-                        "generated_text",
-                    ],
-                    data=[[
-                        step,
-                        "Hi there",
-                        generated_text,
-                    ]],
-                ),
-            })
+            metrics.update({
+                    "val_loss": losses["val"],
+                    "generated_samples": trackio.Table(
+                        columns=[
+                            "step",
+                            "prompt",
+                            "generated_text",
+                        ],
+                        data=[[
+                            step,
+                            "Hi there",
+                            generated_text,
+                        ]],
+                    ),
+                })
 
-    trackio.log(metrics, step=step)
+        trackio.log(metrics, step=step)
 
-    progress.set_postfix(
-            train_loss=f"{loss.item():.4f}"
-        )
+        progress.set_postfix(
+                train_loss=f"{loss.item():.4f}"
+            )
 
-trackio.finish()
+    trackio.finish()
+
+if __name__ == "__main__":
+    main()
